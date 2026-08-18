@@ -1,0 +1,39 @@
+name: KICPA Watcher
+
+on:
+  schedule:
+    # UTC 기준. 10분마다 실행 (KST = UTC+9)
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # 수동 실행 버튼도 사용 가능
+
+permissions:
+  contents: write  # state.json 커밋을 위해 필요
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python kicpa_watcher.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "kicpa-watcher-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "update state.json [skip ci]"
+          git push
