@@ -25,7 +25,11 @@ KICPA(한국공인회계사회) 구인(수습CPA) 게시판 신규 공고 감시
 import json
 import os
 import re
+import smtplib
 import sys
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import requests
@@ -35,6 +39,7 @@ LIST_URL = "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/list.face"
 DETAIL_URL = "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/detail.face?ijIdNum={id}"
 
 STATE_PATH = Path(__file__).parent / "state.json"
+RESUME_PATH = Path(__file__).parent / "입사지원서.docx"
 
 # 목록 페이지 HTML 안에서 게시글 고유 ID(ijIdNum, 13자리 숫자 형태 - 상세페이지
 # detail.face?ijIdNum=1786323784665 에서 확인됨)를 찾기 위한 패턴.
@@ -46,6 +51,24 @@ ID_PATTERN_LOOSE = re.compile(r"\b(\d{10,14})\b")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+NAVER_EMAIL = os.environ.get("NAVER_EMAIL", "")
+NAVER_APP_PASSWORD = os.environ.get("NAVER_APP_PASSWORD", "")
+# TEST_MODE이 "true"(기본값)인 동안은 실제 회사 담당자가 아니라 본인(NAVER_EMAIL)
+# 에게만 지원메일이 갑니다. 여러 번 받아보고 제목/본문/첨부가 정상인 걸
+# 확인한 뒤에만 GitHub Secrets에서 TEST_MODE 값을 "false"로 바꾸세요.
+TEST_MODE = os.environ.get("TEST_MODE", "true").strip().lower() != "false"
+
+SMTP_HOST = "smtp.naver.com"
+SMTP_PORT = 465
+
+EMAIL_SUBJECT_TEMPLATE = "{company} 수습회계사 지원 - 김경식"
+EMAIL_BODY_TEMPLATE = (
+    "안녕하십니까. 제60회 공인회계사 시험에 합격한 김경식입니다.\n\n"
+    "{company}의 수습회계사 채용 공고를 보고 지원하게 되었습니다.\n\n"
+    "감사합니다.\n"
+    "김경식 드림"
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; kicpa-watcher/1.0; +personal use)"
@@ -195,6 +218,51 @@ def send_telegram(text: str) -> None:
         print(f"[ERROR] 텔레그램 전송 실패: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
+def send_application_email(row: dict, detail: dict) -> None:
+    """detail에 이메일이 파싱되어 있으면 지원메일을 발송한다. TEST_MODE일 때는
+    실제 회사가 아니라 본인 메일로만 보낸다."""
+    if not NAVER_EMAIL or not NAVER_APP_PASSWORD:
+        print("[WARN] NAVER_EMAIL / NAVER_APP_PASSWORD 가 설정되지 않아 이메일 발송을 건너뜁니다.")
+        return
+
+    recipient = detail.get("email")
+    if not recipient:
+        print(f"[WARN] #{row['no']} {row['title']} - 담당 이메일을 찾지 못해 자동 지원메일을 보내지 않았습니다.")
+        return
+
+    if not RESUME_PATH.exists():
+        print(f"[WARN] 이력서 파일({RESUME_PATH.name})을 찾을 수 없어 이메일 발송을 건너뜁니다.")
+        return
+
+    subject = EMAIL_SUBJECT_TEMPLATE.format(company=row["company"])
+    body = EMAIL_BODY_TEMPLATE.format(company=row["company"])
+
+    actual_recipient = recipient
+    if TEST_MODE:
+        subject = f"[TEST] {subject} (실제 수신처였을 주소: {recipient})"
+        actual_recipient = NAVER_EMAIL
+
+    msg = MIMEMultipart()
+    msg["From"] = NAVER_EMAIL
+    msg["To"] = actual_recipient
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    with open(RESUME_PATH, "rb") as f:
+        part = MIMEApplication(f.read(), Name=RESUME_PATH.name)
+    part["Content-Disposition"] = f'attachment; filename="{RESUME_PATH.name}"'
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.login(NAVER_EMAIL, NAVER_APP_PASSWORD)
+            server.sendmail(NAVER_EMAIL, actual_recipient, msg.as_string())
+        mode_note = "TEST_MODE" if TEST_MODE else "실제발송"
+        print(f"[INFO] 지원메일 발송({mode_note}): #{row['no']} {row['title']} -> {actual_recipient}")
+    except smtplib.SMTPException as e:
+        print(f"[ERROR] 지원메일 발송 실패: {e}", file=sys.stderr)
+
+
 def main() -> None:
     state = load_state()
     last_seen_no = state.get("last_seen_no", 0)
@@ -220,6 +288,7 @@ def main() -> None:
         message = format_message(row, detail)
         send_telegram(message)
         print(f"[INFO] 알림 전송: #{row['no']} {row['title']}")
+        send_application_email(row, detail)
         max_no = max(max_no, row["no"])
 
     state["last_seen_no"] = max_no
