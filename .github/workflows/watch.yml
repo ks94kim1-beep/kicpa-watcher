@@ -28,8 +28,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NAVER_EMAIL: ${{ secrets.NAVER_EMAIL }}
-          NAVER_APP_PASSWORD: ${{ secrets.NAVER_APP_PASSWORD }}
+          GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TEST_MODE: ${{ secrets.TEST_MODE }}
         run: python kicpa_watcher.py
 
