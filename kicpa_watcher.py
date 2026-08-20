@@ -52,14 +52,14 @@ ID_PATTERN_LOOSE = re.compile(r"\b(\d{10,14})\b")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-NAVER_EMAIL = os.environ.get("NAVER_EMAIL", "")
-NAVER_APP_PASSWORD = os.environ.get("NAVER_APP_PASSWORD", "")
-# TEST_MODE이 "true"(기본값)인 동안은 실제 회사 담당자가 아니라 본인(NAVER_EMAIL)
+GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+# TEST_MODE이 "true"(기본값)인 동안은 실제 회사 담당자가 아니라 본인(GMAIL_EMAIL)
 # 에게만 지원메일이 갑니다. 여러 번 받아보고 제목/본문/첨부가 정상인 걸
 # 확인한 뒤에만 GitHub Secrets에서 TEST_MODE 값을 "false"로 바꾸세요.
 TEST_MODE = os.environ.get("TEST_MODE", "true").strip().lower() != "false"
 
-SMTP_HOST = "smtp.naver.com"
+SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
 EMAIL_SUBJECT_TEMPLATE = "{company} 수습회계사 지원 - 김경식"
@@ -221,8 +221,8 @@ def send_telegram(text: str) -> None:
 def send_application_email(row: dict, detail: dict) -> None:
     """detail에 이메일이 파싱되어 있으면 지원메일을 발송한다. TEST_MODE일 때는
     실제 회사가 아니라 본인 메일로만 보낸다."""
-    if not NAVER_EMAIL or not NAVER_APP_PASSWORD:
-        print("[WARN] NAVER_EMAIL / NAVER_APP_PASSWORD 가 설정되지 않아 이메일 발송을 건너뜁니다.")
+    if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
+        print("[WARN] GMAIL_EMAIL / GMAIL_APP_PASSWORD 가 설정되지 않아 이메일 발송을 건너뜁니다.")
         return
 
     recipient = detail.get("email")
@@ -240,10 +240,10 @@ def send_application_email(row: dict, detail: dict) -> None:
     actual_recipient = recipient
     if TEST_MODE:
         subject = f"[TEST] {subject} (실제 수신처였을 주소: {recipient})"
-        actual_recipient = NAVER_EMAIL
+        actual_recipient = GMAIL_EMAIL
 
     msg = MIMEMultipart()
-    msg["From"] = NAVER_EMAIL
+    msg["From"] = GMAIL_EMAIL
     msg["To"] = actual_recipient
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -255,8 +255,8 @@ def send_application_email(row: dict, detail: dict) -> None:
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.login(NAVER_EMAIL, NAVER_APP_PASSWORD)
-            server.sendmail(NAVER_EMAIL, actual_recipient, msg.as_string())
+            server.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_EMAIL, actual_recipient, msg.as_string())
         mode_note = "TEST_MODE" if TEST_MODE else "실제발송"
         print(f"[INFO] 지원메일 발송({mode_note}): #{row['no']} {row['title']} -> {actual_recipient}")
     except smtplib.SMTPException as e:
