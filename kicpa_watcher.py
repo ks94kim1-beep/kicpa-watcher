@@ -75,10 +75,23 @@ HEADERS = {
 }
 
 
+def fingerprint(row: dict) -> str:
+    """행의 고유 식별자. ijIdNum이 잡히면 그걸 쓰고, 못 잡았으면 제목+회사+
+    등록일 조합으로 대체 식별한다 (완벽하진 않지만 안전한 폴백)."""
+    if row.get("id"):
+        return f"id:{row['id']}"
+    return f"fp:{row['title']}|{row['company']}|{row['posted_at']}"
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    return {"last_seen_no": 0}
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        # 예전 형식(last_seen_no 기반)에서 새 형식(seen_ids 기반)으로 마이그레이션
+        if "seen_ids" not in data:
+            data["seen_ids"] = []
+            data["_migrated_from_last_seen_no"] = True
+        return data
+    return {"seen_ids": []}
 
 
 def save_state(state: dict) -> None:
@@ -265,7 +278,8 @@ def send_application_email(row: dict, detail: dict) -> None:
 
 def main() -> None:
     state = load_state()
-    last_seen_no = state.get("last_seen_no", 0)
+    seen_ids = set(state.get("seen_ids", []))
+    is_migration_bootstrap = state.pop("_migrated_from_last_seen_no", False)
 
     html = fetch_list_html()
     rows = parse_rows(html)
@@ -274,24 +288,38 @@ def main() -> None:
         print("[WARN] 게시글 파싱 결과가 비어 있습니다. 페이지 구조가 바뀌었을 수 있습니다.")
         return
 
-    new_rows = [r for r in rows if r["no"] > last_seen_no]
-    # 오래된 것부터 순서대로 알림을 보내도록 정렬
+    for row in rows:
+        row["_fp"] = fingerprint(row)
+
+    if is_migration_bootstrap:
+        # 예전(번호 비교) 방식에서 막 넘어온 첫 실행: 지금 보이는 글들을
+        # 전부 "이미 확인함"으로만 기록하고, 알림은 보내지 않는다. (과거
+        # 글을 전부 신규로 오인해서 한꺼번에 스팸 보내는 걸 방지)
+        seen_ids.update(row["_fp"] for row in rows)
+        state["seen_ids"] = sorted(seen_ids)[-500:]
+        save_state(state)
+        print(f"[INFO] state.json을 새 형식으로 마이그레이션했습니다. 이번 실행은 알림을 생략합니다. (등록: {len(rows)}건)")
+        return
+
+    new_rows = [r for r in rows if r["_fp"] not in seen_ids]
+    # 목록은 보통 최신글이 위(번호 큰 순)로 오므로, 오래된 것부터 순서대로
+    # 알림을 보내도록 번호 오름차순 정렬
     new_rows.sort(key=lambda r: r["no"])
 
     if not new_rows:
-        print(f"[INFO] 신규 공고 없음. (마지막 확인 번호: {last_seen_no})")
+        print(f"[INFO] 신규 공고 없음. (확인된 글 수: {len(seen_ids)})")
         return
 
-    max_no = last_seen_no
     for row in new_rows:
         detail = fetch_detail(row["id"]) if row.get("id") else {}
         message = format_message(row, detail)
         send_telegram(message)
         print(f"[INFO] 알림 전송: #{row['no']} {row['title']}")
         send_application_email(row, detail)
-        max_no = max(max_no, row["no"])
+        seen_ids.add(row["_fp"])
 
-    state["last_seen_no"] = max_no
+    # seen_ids가 무한정 커지지 않도록 최근 500개만 유지
+    state["seen_ids"] = sorted(seen_ids)[-500:]
     save_state(state)
 
 
