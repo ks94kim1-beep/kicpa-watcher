@@ -43,9 +43,15 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+
+# 상세페이지에 이런 확장자의 첨부파일이 하나라도 있으면 "회사가 자체 지원서
+# 양식을 요구하는 것"으로 보고, 범용 이력서를 자동으로 보내지 않는다. 대신
+# 텔레그램 알림에 첨부파일 정보를 담아 사람이 직접 확인/작성하도록 한다.
+ATTACHMENT_EXT_PATTERN = re.compile(r"\.(docx?|hwpx?|xlsx?|pdf|zip)$", re.IGNORECASE)
 
 STATE_PATH = Path(__file__).parent / "state.json"
 RESUME_PATH = Path(__file__).parent / "입사지원서.docx"
@@ -226,9 +232,10 @@ def parse_rows(html: str) -> list[dict]:
 
 
 def fetch_detail(detail_url_tmpl: str, row_id: str) -> dict:
-    """상세페이지에서 이메일/마감일 등을 best-effort로 뽑는다."""
+    """상세페이지에서 이메일/마감일/첨부파일 등을 best-effort로 뽑는다."""
     try:
-        resp = requests.get(detail_url_tmpl.format(id=row_id), headers=HEADERS, timeout=15)
+        detail_url = detail_url_tmpl.format(id=row_id)
+        resp = requests.get(detail_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -241,6 +248,27 @@ def fetch_detail(detail_url_tmpl: str, row_id: str) -> dict:
         deadline_match = re.search(r"마감일[^\d]*(\d{4}\.\d{2}\.\d{2})", text)
         if deadline_match:
             detail["deadline"] = deadline_match.group(1)
+
+        # 첨부파일(자체 지원서 양식 등) 탐지: <a> 태그의 href나 텍스트가
+        # docx/hwp/xlsx/pdf/zip 같은 파일 확장자로 끝나면 첨부파일로 간주한다.
+        attachments = []
+        seen_urls = set()
+        for a in soup.find_all("a"):
+            href = (a.get("href") or "").strip()
+            link_text = a.get_text(strip=True)
+            candidate = link_text if ATTACHMENT_EXT_PATTERN.search(link_text) else href
+            if not ATTACHMENT_EXT_PATTERN.search(candidate):
+                continue
+            abs_url = urljoin(detail_url, href) if href and href != "#" else ""
+            dedup_key = abs_url or link_text
+            if dedup_key in seen_urls:
+                continue
+            seen_urls.add(dedup_key)
+            attachments.append({"name": link_text or candidate, "url": abs_url})
+
+        if attachments:
+            detail["attachments"] = attachments
+
         return detail
     except requests.RequestException:
         return {}
@@ -267,6 +295,14 @@ def format_message(board: dict, row: dict, detail: dict) -> str:
         lines.append(f"마감일: {detail['deadline']}")
     if detail.get("email"):
         lines.append(f"담당 이메일: {detail['email']}")
+    if detail.get("attachments"):
+        lines.append("")
+        lines.append("⚠️ 자체 양식 첨부됨 - 자동지원 보류, 직접 확인 후 지원해주세요")
+        for att in detail["attachments"]:
+            if att["url"]:
+                lines.append(f"- {att['name']} : {att['url']}")
+            else:
+                lines.append(f"- {att['name']}")
     lines.append("")
     if row.get("id"):
         lines.append(board["detail_url"].format(id=row["id"]))
@@ -373,7 +409,10 @@ def process_board(board: dict, state: dict) -> None:
         message = format_message(board, row, detail)
         send_telegram(message)
         print(f"[INFO] [{board['key']}] 알림 전송: #{row['no']} {row['title']}")
-        send_application_email(row, detail)
+        if detail.get("attachments"):
+            print(f"[INFO] [{board['key']}] #{row['no']} {row['title']} - 첨부파일(자체 양식) 감지, 자동 지원메일 건너뜀.")
+        else:
+            send_application_email(row, detail)
         seen_ids.add(row["_fp"])
 
     state["seen_ids"] = sorted(seen_ids)[-1000:]
