@@ -1,25 +1,37 @@
 """
-KICPA(한국공인회계사회) 구인(수습CPA) 게시판 신규 공고 감시 → 텔레그램 알림
+KICPA(한국공인회계사회) 구인게시판 신규 공고 감시 → 텔레그램 알림 + 자동 지원메일
+
+감시 대상 2개 게시판
+--------------------
+1. 구인(수습CPA) - jobOffrSrchNewGnrl : 이미 수습/합격자 대상으로 스코프가 좁혀진
+   게시판이라 별도 필터 없이 전부 감시한다.
+2. 구인(CPA) - jobOffrSrchGnrl : 경력직 등 전체 채용공고가 섞여 올라오는 일반
+   게시판. 제목에 "신입" 또는 "수습"이 들어간 것만 걸러서 감시한다.
+
+두 게시판은 표 컬럼 구성이 다르다(수습CPA는 "고용형태" 컬럼이 있고, 일반게시판은
+없는 대신 "채용구분" 컬럼이 있음). 그래서 컬럼 위치를 고정하지 않고, 헤더 행의
+텍스트를 읽어서 이름 기반으로 매핑한다.
 
 동작 방식
 ---------
-1. 목록 페이지(list.face)를 요청해서 게시글 표를 파싱한다.
-2. 각 행에서 "번호"(게시글 순번)를 뽑아, state.json에 저장된 마지막으로 본
-   번호보다 큰 행만 "신규"로 판단한다. (robots.txt 상 크롤링 자체는 허용된
-   상태 - Allow: / - 이지만, 서버 부하를 줄이기 위해 10분에 1회, 목록 페이지
-   1회 요청만 하는 것을 기본으로 한다.)
-3. 신규 글이 있으면, 가능하면 상세페이지(ijIdNum)까지 찾아 이메일/마감일 등
-   추가 정보를 붙이고, 텔레그램으로 전송한다.
-4. 처리한 최신 번호를 state.json에 저장한다. (GitHub Actions에서는 워크플로우가
-   이 파일을 커밋해서 다음 실행 때 이어서 비교한다.)
+1. 각 게시판의 목록 페이지를 요청해서 표를 파싱한다 (헤더 기반 동적 매핑).
+2. 일반게시판은 제목에 신입/수습 키워드가 없는 행을 걸러낸다.
+3. 각 행의 게시글 ID(ijIdNum)를 뽑아 "이미 확인한 글 목록"(state.json의
+   seen_ids)에 있는지로 신규 여부를 판단한다 (번호 크기 비교 방식이 아님 -
+   자동삭제로 번호가 줄어들 수 있어서 번호 비교는 신뢰할 수 없다).
+4. 새 게시판을 처음 추가한 시점에는, 그 게시판에 이미 있던 글들을 한꺼번에
+   "신규"로 오인해서 스팸 알림을 보내지 않도록, 게시판별로 "첫 실행 1회"는
+   조용히 seen_ids만 채우고 알림은 생략한다 (bootstrapped_boards로 추적).
+5. 신규 글이 있으면 상세페이지에서 이메일/마감일 등을 찾아 텔레그램 알림 +
+   (TEST_MODE 아니면 실제) 지원메일을 보낸다.
+6. 처리 결과를 state.json에 저장하고, GitHub Actions가 이 파일을 커밋해서
+   다음 실행 때 이어서 비교한다.
 
 주의
 ----
-- 목록 페이지의 "상세보기" 링크는 순수 <a href="..."> 가 아니라 자바스크립트로
-  동작하는 것으로 보인다(예: onclick 핸들러 안에 ijIdNum이 들어있는 방식).
-  이 스크립트는 정규식으로 그 숫자 ID를 최대한 찾아보고, 못 찾으면 상세 링크
-  없이 목록 페이지 링크로 대체한다. 배포 후 첫 실행 로그에서 상세 링크가
-  잘 잡히는지 꼭 확인해서 필요하면 ID_PATTERN 정규식을 조정할 것.
+- 목록 페이지의 "상세보기" 링크는 자바스크립트로 동작하는 것으로 보여서,
+  정규식으로 ijIdNum 숫자를 최대한 추측해서 찾는다. 실패하면 상세 정보 없이
+  목록 링크로 대체한다.
 """
 
 import json
@@ -35,17 +47,33 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-LIST_URL = "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/list.face"
-DETAIL_URL = "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/detail.face?ijIdNum={id}"
-
 STATE_PATH = Path(__file__).parent / "state.json"
 RESUME_PATH = Path(__file__).parent / "입사지원서.docx"
 
+# 감시할 게시판 목록. "intern" 게시판은 기존부터 감시해오던 곳이라 seen_ids
+# 식별자를 예전 형식(prefix 없음) 그대로 유지해서 이미 저장된 state.json과
+# 호환되게 한다. 새로 추가하는 게시판은 board key를 prefix로 붙여 구분한다.
+BOARDS = [
+    {
+        "key": "intern",
+        "label": "KICPA 신규 채용공고",
+        "list_url": "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/list.face",
+        "detail_url": "https://www.kicpa.or.kr/home/jobOffrSrchNewGnrl/detail.face?ijIdNum={id}",
+        "title_keywords": None,  # 필터 없음 (이미 수습CPA 전용 게시판)
+        "id_prefix": "",  # 예전 seen_ids 형식과 호환을 위해 접두어 없음
+    },
+    {
+        "key": "general",
+        "label": "KICPA 일반구인 (신입/수습)",
+        "list_url": "https://www.kicpa.or.kr/home/jobOffrSrchGnrl/list.face",
+        "detail_url": "https://www.kicpa.or.kr/home/jobOffrSrchGnrl/detail.face?ijIdNum={id}",
+        "title_keywords": ["신입", "수습"],  # 제목에 이 중 하나라도 있어야 통과
+        "id_prefix": "gnrl:",
+    },
+]
+
 # 목록 페이지 HTML 안에서 게시글 고유 ID(ijIdNum, 13자리 숫자 형태 - 상세페이지
 # detail.face?ijIdNum=1786323784665 에서 확인됨)를 찾기 위한 패턴.
-# 정확한 자바스크립트 함수명(onclick="fn_view('...')" 등)을 모르는 상태라,
-# 우선 "ijIdNum=" 형태를 먼저 찾고, 없으면 10~14자리 숫자를 폭넓게 찾는다.
-# 실제 배포 후 첫 실행 로그(각 row의 id 값)를 보고 오탐이 있으면 좁혀서 조정할 것.
 ID_PATTERN_STRICT = re.compile(r"ijIdNum['\"]?\s*[:=]\s*['\"]?(\d{10,})")
 ID_PATTERN_LOOSE = re.compile(r"\b(\d{10,14})\b")
 
@@ -62,10 +90,10 @@ TEST_MODE = os.environ.get("TEST_MODE", "true").strip().lower() != "false"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
-EMAIL_SUBJECT_TEMPLATE = "{company} 수습회계사 지원 - 김경식"
+EMAIL_SUBJECT_TEMPLATE = "{company} {position} 지원 - 김경식"
 EMAIL_BODY_TEMPLATE = (
     "안녕하십니까. 제60회 공인회계사 시험에 합격한 김경식입니다.\n\n"
-    "{company}의 수습회계사 채용 공고를 보고 지원하게 되었습니다.\n\n"
+    "{company}의 {position} 채용 공고를 보고 지원하게 되었습니다.\n\n"
     "감사합니다.\n"
     "김경식 드림"
 )
@@ -75,43 +103,60 @@ HEADERS = {
 }
 
 
-def fingerprint(row: dict) -> str:
+def position_word(title: str) -> str:
+    """공고 제목에서 지원메일에 쓸 직무 명칭을 뽑는다."""
+    if "수습" in title:
+        return "수습회계사"
+    if "신입" in title:
+        return "신입회계사"
+    return "채용"
+
+
+def fingerprint(board: dict, row: dict) -> str:
     """행의 고유 식별자. ijIdNum이 잡히면 그걸 쓰고, 못 잡았으면 제목+회사+
-    등록일 조합으로 대체 식별한다 (완벽하진 않지만 안전한 폴백)."""
+    등록일 조합으로 대체 식별한다."""
+    prefix = board["id_prefix"]
     if row.get("id"):
-        return f"id:{row['id']}"
-    return f"fp:{row['title']}|{row['company']}|{row['posted_at']}"
+        return f"{prefix}id:{row['id']}"
+    return f"{prefix}fp:{row.get('title','')}|{row.get('company','')}|{row.get('posted_at','')}"
 
 
 def load_state() -> dict:
     if STATE_PATH.exists():
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        # 예전 형식(last_seen_no 기반)에서 새 형식(seen_ids 기반)으로 마이그레이션
+        migrated = False
         if "seen_ids" not in data:
             data["seen_ids"] = []
-            data["_migrated_from_last_seen_no"] = True
+            migrated = True
+        if "bootstrapped_boards" not in data:
+            # 이 필드가 아예 없다는 건 "intern" 게시판만 감시하던 예전 버전이라는
+            # 뜻이라, intern은 이미 정상 운영중이었던 걸로 간주해 부트스트랩을
+            # 건너뛴다. general처럼 새로 추가되는 게시판만 부트스트랩 대상.
+            data["bootstrapped_boards"] = ["intern"]
+            migrated = True
+        data["_migrated"] = migrated
         return data
-    return {"seen_ids": []}
+    return {"seen_ids": [], "bootstrapped_boards": []}
 
 
 def save_state(state: dict) -> None:
+    state.pop("_migrated", None)
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def fetch_list_html() -> str:
-    resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
+def fetch_list_html(list_url: str) -> str:
+    resp = requests.get(list_url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
     return resp.text
 
 
 def parse_rows(html: str) -> list[dict]:
-    """게시판 표를 파싱해서 행 리스트를 반환. 각 행: no, title, company, region,
-    status, employment_type, posted_at, id(있으면)."""
+    """게시판 표를 헤더 이름 기반으로 파싱해서 행 리스트를 반환한다.
+    각 행: no, title, company, region, status, employment_type, posted_at, id."""
     soup = BeautifulSoup(html, "html.parser")
     rows = []
 
-    # id 후보들을 문서 순서대로 미리 뽑아둔다 (행과의 매칭은 best-effort).
     ids_in_order = ID_PATTERN_STRICT.findall(html)
 
     table = None
@@ -124,19 +169,27 @@ def parse_rows(html: str) -> list[dict]:
     if table is None:
         return rows
 
+    trs = table.find_all("tr")
+    if not trs:
+        return rows
+
+    # 첫 번째 tr을 헤더로 간주하고 라벨을 뽑는다.
+    header_cells = trs[0].find_all(["th", "td"])
+    header_labels = [c.get_text(strip=True) for c in header_cells]
+
     id_cursor = 0
-    for tr in table.find_all("tr"):
+    for tr in trs[1:]:
         cells = tr.find_all("td")
-        if len(cells) < 7:
+        if len(cells) < 2:
             continue
         texts = [c.get_text(strip=True) for c in cells]
-        no_text = texts[0]
+        row_map = dict(zip(header_labels, texts))
+
+        no_text = row_map.get("번호", texts[0] if texts else "")
         if not no_text.isdigit():
             continue
 
         row_id = None
-        # 이 행의 <a> 태그 onclick/href 속성에서 직접 ID를 찾아본다.
-        # 먼저 "ijIdNum=" 명시 패턴, 없으면 10~14자리 숫자 아무거나.
         link_tag = tr.find("a")
         if link_tag is not None:
             attr_text = " ".join(
@@ -152,7 +205,6 @@ def parse_rows(html: str) -> list[dict]:
             row_id = ids_in_order[id_cursor]
             id_cursor += 1
         if row_id is None:
-            # 전체 페이지에서 헐겁게 찾은 숫자들도 최후 수단으로 시도한다.
             loose_ids = ID_PATTERN_LOOSE.findall(html)
             if id_cursor < len(loose_ids):
                 row_id = loose_ids[id_cursor]
@@ -160,12 +212,12 @@ def parse_rows(html: str) -> list[dict]:
         rows.append(
             {
                 "no": int(no_text),
-                "title": texts[1],
-                "company": texts[2],
-                "region": texts[3],
-                "status": texts[4],
-                "employment_type": texts[5],
-                "posted_at": texts[6],
+                "title": row_map.get("제목", ""),
+                "company": row_map.get("회사명", ""),
+                "region": row_map.get("지역", ""),
+                "status": row_map.get("구직완료 구분") or row_map.get("채용구분") or "",
+                "employment_type": row_map.get("고용형태", ""),
+                "posted_at": row_map.get("등록일자", ""),
                 "id": row_id,
             }
         )
@@ -173,11 +225,10 @@ def parse_rows(html: str) -> list[dict]:
     return rows
 
 
-def fetch_detail(row_id: str) -> dict:
-    """상세페이지에서 이메일/마감일 등을 best-effort로 뽑는다. 실패해도 예외를
-    던지지 않고 빈 dict를 반환한다."""
+def fetch_detail(detail_url_tmpl: str, row_id: str) -> dict:
+    """상세페이지에서 이메일/마감일 등을 best-effort로 뽑는다."""
     try:
-        resp = requests.get(DETAIL_URL.format(id=row_id), headers=HEADERS, timeout=15)
+        resp = requests.get(detail_url_tmpl.format(id=row_id), headers=HEADERS, timeout=15)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -195,24 +246,32 @@ def fetch_detail(row_id: str) -> dict:
         return {}
 
 
-def format_message(row: dict, detail: dict) -> str:
+def format_message(board: dict, row: dict, detail: dict) -> str:
     lines = [
-        "🚨 KICPA 신규 채용공고",
+        f"🚨 {board['label']}",
         "",
         f"[{row['company']}] {row['title']}",
-        f"지역: {row['region']} / 고용형태: {row['employment_type']}",
-        f"등록일: {row['posted_at']}",
     ]
+    extra = []
+    if row.get("region"):
+        extra.append(f"지역: {row['region']}")
+    if row.get("employment_type"):
+        extra.append(f"고용형태: {row['employment_type']}")
+    elif row.get("status"):
+        extra.append(f"채용구분: {row['status']}")
+    if extra:
+        lines.append(" / ".join(extra))
+    if row.get("posted_at"):
+        lines.append(f"등록일: {row['posted_at']}")
     if detail.get("deadline"):
         lines.append(f"마감일: {detail['deadline']}")
     if detail.get("email"):
         lines.append(f"담당 이메일: {detail['email']}")
+    lines.append("")
     if row.get("id"):
-        lines.append("")
-        lines.append(DETAIL_URL.format(id=row["id"]))
+        lines.append(board["detail_url"].format(id=row["id"]))
     else:
-        lines.append("")
-        lines.append(LIST_URL)
+        lines.append(board["list_url"])
     return "\n".join(lines)
 
 
@@ -247,8 +306,9 @@ def send_application_email(row: dict, detail: dict) -> None:
         print(f"[WARN] 이력서 파일({RESUME_PATH.name})을 찾을 수 없어 이메일 발송을 건너뜁니다.")
         return
 
-    subject = EMAIL_SUBJECT_TEMPLATE.format(company=row["company"])
-    body = EMAIL_BODY_TEMPLATE.format(company=row["company"])
+    position = position_word(row["title"])
+    subject = EMAIL_SUBJECT_TEMPLATE.format(company=row["company"], position=position)
+    body = EMAIL_BODY_TEMPLATE.format(company=row["company"], position=position)
 
     actual_recipient = recipient
     if TEST_MODE:
@@ -276,50 +336,53 @@ def send_application_email(row: dict, detail: dict) -> None:
         print(f"[ERROR] 지원메일 발송 실패: {e}", file=sys.stderr)
 
 
-def main() -> None:
-    state = load_state()
-    seen_ids = set(state.get("seen_ids", []))
-    is_migration_bootstrap = state.pop("_migrated_from_last_seen_no", False)
+def process_board(board: dict, state: dict) -> None:
+    seen_ids = set(state["seen_ids"])
+    is_bootstrap = board["key"] not in state["bootstrapped_boards"]
 
-    html = fetch_list_html()
+    html = fetch_list_html(board["list_url"])
     rows = parse_rows(html)
 
     if not rows:
-        print("[WARN] 게시글 파싱 결과가 비어 있습니다. 페이지 구조가 바뀌었을 수 있습니다.")
+        print(f"[WARN] [{board['key']}] 게시글 파싱 결과가 비어 있습니다. 페이지 구조가 바뀌었을 수 있습니다.")
         return
 
-    for row in rows:
-        row["_fp"] = fingerprint(row)
+    keywords = board.get("title_keywords")
+    if keywords:
+        rows = [r for r in rows if any(kw in r["title"] for kw in keywords)]
 
-    if is_migration_bootstrap:
-        # 예전(번호 비교) 방식에서 막 넘어온 첫 실행: 지금 보이는 글들을
-        # 전부 "이미 확인함"으로만 기록하고, 알림은 보내지 않는다. (과거
-        # 글을 전부 신규로 오인해서 한꺼번에 스팸 보내는 걸 방지)
+    for row in rows:
+        row["_fp"] = fingerprint(board, row)
+
+    if is_bootstrap:
         seen_ids.update(row["_fp"] for row in rows)
-        state["seen_ids"] = sorted(seen_ids)[-500:]
-        save_state(state)
-        print(f"[INFO] state.json을 새 형식으로 마이그레이션했습니다. 이번 실행은 알림을 생략합니다. (등록: {len(rows)}건)")
+        state["seen_ids"] = sorted(seen_ids)[-1000:]
+        state["bootstrapped_boards"].append(board["key"])
+        print(f"[INFO] [{board['key']}] 최초 감시 시작 - 현재 글 {len(rows)}건을 조용히 등록만 했습니다 (알림 생략).")
         return
 
     new_rows = [r for r in rows if r["_fp"] not in seen_ids]
-    # 목록은 보통 최신글이 위(번호 큰 순)로 오므로, 오래된 것부터 순서대로
-    # 알림을 보내도록 번호 오름차순 정렬
     new_rows.sort(key=lambda r: r["no"])
 
     if not new_rows:
-        print(f"[INFO] 신규 공고 없음. (확인된 글 수: {len(seen_ids)})")
+        print(f"[INFO] [{board['key']}] 신규 공고 없음. (확인된 글 수: {len(seen_ids)})")
         return
 
     for row in new_rows:
-        detail = fetch_detail(row["id"]) if row.get("id") else {}
-        message = format_message(row, detail)
+        detail = fetch_detail(board["detail_url"], row["id"]) if row.get("id") else {}
+        message = format_message(board, row, detail)
         send_telegram(message)
-        print(f"[INFO] 알림 전송: #{row['no']} {row['title']}")
+        print(f"[INFO] [{board['key']}] 알림 전송: #{row['no']} {row['title']}")
         send_application_email(row, detail)
         seen_ids.add(row["_fp"])
 
-    # seen_ids가 무한정 커지지 않도록 최근 500개만 유지
-    state["seen_ids"] = sorted(seen_ids)[-500:]
+    state["seen_ids"] = sorted(seen_ids)[-1000:]
+
+
+def main() -> None:
+    state = load_state()
+    for board in BOARDS:
+        process_board(board, state)
     save_state(state)
 
 
