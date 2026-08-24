@@ -12,5 +12,9 @@
     "id:1787125506567",
     "id:1787205050618",
     "id:1787472623099"
+  ],
+  "bootstrapped_boards": [
+    "intern",
+    "general"
   ]
 }
