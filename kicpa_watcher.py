@@ -34,27 +34,34 @@ KICPA(한국공인회계사회) 구인게시판 신규 공고 감시 → 텔레�
   목록 링크로 대체한다.
 """
 
+import imaplib
 import json
 import os
 import re
 import smtplib
 import sys
+from datetime import datetime, timedelta, timezone
+from email import message_from_bytes
+from email.header import decode_header
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-# 상세페이지에 이런 확장자의 첨부파일이 하나라도 있으면 "회사가 자체 지원서
-# 양식을 요구하는 것"으로 보고, 범용 이력서를 자동으로 보내지 않는다. 대신
-# 텔레그램 알림에 첨부파일 정보를 담아 사람이 직접 확인/작성하도록 한다.
-ATTACHMENT_EXT_PATTERN = re.compile(r"\.(docx?|hwpx?|xlsx?|pdf|zip)$", re.IGNORECASE)
+# 상세페이지에 이런 확장자의 첨부파일이 있으면 "회사가 자체 지원서 양식을
+# 요구하는 것"으로 보고, 범용 이력서를 자동으로 보내지 않는다. docx/hwp만
+# 대상으로 한다 - pdf/xlsx/pptx/zip 등은 회사소개 자료나 공고 원문 PDF인
+# 경우가 많아서 여기 포함하면 오탐(정상 발송 건너뜀)이 너무 잦아진다.
+ATTACHMENT_EXT_PATTERN = re.compile(r"\.(docx?|hwpx?)$", re.IGNORECASE)
 
 STATE_PATH = Path(__file__).parent / "state.json"
 RESUME_PATH = Path(__file__).parent / "입사지원서.docx"
+RESUME_PDF_PATH = Path(__file__).parent / "입사지원서.pdf"
 
 # 감시할 게시판 목록. "intern" 게시판은 기존부터 감시해오던 곳이라 seen_ids
 # 식별자를 예전 형식(prefix 없음) 그대로 유지해서 이미 저장된 state.json과
@@ -95,6 +102,11 @@ TEST_MODE = os.environ.get("TEST_MODE", "true").strip().lower() != "false"
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+# 답장 확인 시 이 기간(일) 이내에 받은 메일만 훑는다. 너무 오래된 지원 건에
+# 대한 답장까지 매번 다 뒤질 필요는 없어서 범위를 제한한다.
+REPLY_CHECK_LOOKBACK_DAYS = 45
 
 EMAIL_SUBJECT_TEMPLATE = "{company} {position} 지원 - 김경식"
 EMAIL_BODY_TEMPLATE = (
@@ -140,9 +152,16 @@ def load_state() -> dict:
             # 건너뛴다. general처럼 새로 추가되는 게시판만 부트스트랩 대상.
             data["bootstrapped_boards"] = ["intern"]
             migrated = True
+        data.setdefault("sent_applications", [])
+        data.setdefault("notified_reply_ids", [])
         data["_migrated"] = migrated
         return data
-    return {"seen_ids": [], "bootstrapped_boards": []}
+    return {
+        "seen_ids": [],
+        "bootstrapped_boards": [],
+        "sent_applications": [],
+        "notified_reply_ids": [],
+    }
 
 
 def save_state(state: dict) -> None:
@@ -326,21 +345,23 @@ def send_telegram(text: str) -> None:
         print(f"[ERROR] 텔레그램 전송 실패: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
-def send_application_email(row: dict, detail: dict) -> None:
+def send_application_email(row: dict, detail: dict) -> dict | None:
     """detail에 이메일이 파싱되어 있으면 지원메일을 발송한다. TEST_MODE일 때는
-    실제 회사가 아니라 본인 메일로만 보낸다."""
+    실제 회사가 아니라 본인 메일로만 보낸다. 실제(TEST_MODE 아닌) 발송이
+    성공하면 나중에 답장 확인용으로 쓸 기록(dict)을 반환하고, 그 외에는
+    None을 반환한다."""
     if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
         print("[WARN] GMAIL_EMAIL / GMAIL_APP_PASSWORD 가 설정되지 않아 이메일 발송을 건너뜁니다.")
-        return
+        return None
 
     recipient = detail.get("email")
     if not recipient:
         print(f"[WARN] #{row['no']} {row['title']} - 담당 이메일을 찾지 못해 자동 지원메일을 보내지 않았습니다.")
-        return
+        return None
 
     if not RESUME_PATH.exists():
         print(f"[WARN] 이력서 파일({RESUME_PATH.name})을 찾을 수 없어 이메일 발송을 건너뜁니다.")
-        return
+        return None
 
     position = position_word(row["title"])
     subject = EMAIL_SUBJECT_TEMPLATE.format(company=row["company"], position=position)
@@ -362,14 +383,30 @@ def send_application_email(row: dict, detail: dict) -> None:
     part["Content-Disposition"] = f'attachment; filename="{RESUME_PATH.name}"'
     msg.attach(part)
 
+    if RESUME_PDF_PATH.exists():
+        with open(RESUME_PDF_PATH, "rb") as f:
+            pdf_part = MIMEApplication(f.read(), Name=RESUME_PDF_PATH.name, _subtype="pdf")
+        pdf_part["Content-Disposition"] = f'attachment; filename="{RESUME_PDF_PATH.name}"'
+        msg.attach(pdf_part)
+    else:
+        print("[WARN] 입사지원서.pdf 파일이 없어 PDF는 첨부하지 못했습니다 (docx만 첨부됨).")
+
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
             server.sendmail(GMAIL_EMAIL, actual_recipient, msg.as_string())
         mode_note = "TEST_MODE" if TEST_MODE else "실제발송"
         print(f"[INFO] 지원메일 발송({mode_note}): #{row['no']} {row['title']} -> {actual_recipient}")
+        if not TEST_MODE:
+            return {
+                "email": recipient.lower(),
+                "company": row["company"],
+                "title": row["title"],
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            }
     except smtplib.SMTPException as e:
         print(f"[ERROR] 지원메일 발송 실패: {e}", file=sys.stderr)
+    return None
 
 
 def process_board(board: dict, state: dict) -> None:
@@ -412,16 +449,105 @@ def process_board(board: dict, state: dict) -> None:
         if detail.get("attachments"):
             print(f"[INFO] [{board['key']}] #{row['no']} {row['title']} - 첨부파일(자체 양식) 감지, 자동 지원메일 건너뜀.")
         else:
-            send_application_email(row, detail)
+            record = send_application_email(row, detail)
+            if record:
+                state.setdefault("sent_applications", []).append(record)
         seen_ids.add(row["_fp"])
 
     state["seen_ids"] = sorted(seen_ids)[-1000:]
+
+
+def decode_mime_words(raw: str) -> str:
+    """메일 제목 등에 쓰이는 MIME 인코딩(=?UTF-8?B?...?=)을 사람이 읽을 수
+    있는 문자열로 풀어준다."""
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    out = []
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            out.append(text.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(text)
+    return "".join(out)
+
+
+def check_email_replies(state: dict) -> None:
+    """Gmail 받은편지함을 확인해서, 우리가 실제로 지원메일을 보냈던 회사
+    주소로부터 온 메일이 있으면 텔레그램으로 알려준다. 같은 메일에 대해
+    중복 알림이 가지 않도록 Message-ID 기준으로 기록해둔다."""
+    if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
+        return
+
+    sent_apps = state.get("sent_applications", [])
+    if not sent_apps:
+        return
+
+    sender_to_company = {}
+    for app in sent_apps:
+        sender_to_company.setdefault(app["email"].lower(), app["company"])
+
+    notified = set(state.get("notified_reply_ids", []))
+
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=20)
+        imap.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+        imap.select("INBOX")
+
+        since_date = (datetime.now(timezone.utc) - timedelta(days=REPLY_CHECK_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+        status, data = imap.search(None, f"(SINCE {since_date})")
+        if status != "OK" or not data or not data[0]:
+            imap.logout()
+            return
+
+        msg_ids = data[0].split()
+        for msg_id in msg_ids:
+            status, msg_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER])")
+            if status != "OK" or not msg_data or msg_data[0] is None:
+                continue
+            raw_header = msg_data[0][1]
+            msg = message_from_bytes(raw_header)
+
+            _, from_addr = parseaddr(msg.get("From", ""))
+            from_addr_l = from_addr.lower()
+            if from_addr_l not in sender_to_company:
+                continue
+
+            message_id = (msg.get("Message-ID") or "").strip() or f"uid:{msg_id.decode()}"
+            if message_id in notified:
+                continue
+
+            subject = decode_mime_words(msg.get("Subject", "(제목 없음)"))
+            company = sender_to_company[from_addr_l]
+
+            text = (
+                "📩 지원메일에 답장이 왔습니다!\n\n"
+                f"회사: {company}\n"
+                f"보낸사람: {from_addr}\n"
+                f"제목: {subject}\n\n"
+                "Gmail에서 내용을 확인해주세요."
+            )
+            send_telegram(text)
+            print(f"[INFO] 답장 알림 전송: {company} <{from_addr}>")
+            notified.add(message_id)
+
+        imap.logout()
+    except (imaplib.IMAP4.error, OSError) as e:
+        print(f"[WARN] 메일 답장 확인 중 오류(다음 실행에 재시도): {e}", file=sys.stderr)
+
+    state["notified_reply_ids"] = sorted(notified)[-1000:]
 
 
 def main() -> None:
     state = load_state()
     for board in BOARDS:
         process_board(board, state)
+
+    if "sent_applications" in state:
+        state["sent_applications"] = state["sent_applications"][-500:]
+
+    check_email_replies(state)
+
     save_state(state)
 
 
