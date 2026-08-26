@@ -99,7 +99,7 @@ SMTP_PORT = 465
 EMAIL_SUBJECT_TEMPLATE = "{company} {position} 지원 - 김경식"
 EMAIL_BODY_TEMPLATE = (
     "안녕하십니까. 제60회 공인회계사 시험에 합격한 김경식입니다.\n\n"
-    "{company}의 {position} 채용 공고를 보고 지원하게 되었습니다.\n\n"
+    "{company}의 {position} 공고를 보고 지원하게 되었습니다.\n\n"
     "감사합니다.\n"
     "김경식 드림"
 )
