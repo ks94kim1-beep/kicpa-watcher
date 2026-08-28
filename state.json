@@ -14,12 +14,20 @@
     "id:1787472623099",
     "id:1787556087965",
     "id:1787557874237",
-    "id:1787728565691"
+    "id:1787728565691",
+    "id:1787875764397"
   ],
   "bootstrapped_boards": [
     "intern",
     "general"
   ],
-  "sent_applications": [],
+  "sent_applications": [
+    {
+      "email": "recruit.kr@forvismazars.com",
+      "company": "새빛회계법인",
+      "title": "[Forvis Mazars 새빛회계법인] 2026년 신입 공인회계사 모집",
+      "sent_at": "2026-08-28T00:10:26.233171+00:00"
+    }
+  ],
   "notified_reply_ids": []
 }
