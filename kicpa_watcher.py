@@ -17,14 +17,22 @@ KICPA(한국공인회계사회) 구인게시판 신규 공고 감시 → 텔레�
 1. 각 게시판의 목록 페이지를 요청해서 표를 파싱한다 (헤더 기반 동적 매핑).
 2. 일반게시판은 제목에 신입/수습 키워드가 없는 행을 걸러낸다.
 3. 각 행의 게시글 ID(ijIdNum)를 뽑아 "이미 확인한 글 목록"(state.json의
-   seen_ids)에 있는지로 신규 여부를 판단한다 (번호 크기 비교 방식이 아님 -
-   자동삭제로 번호가 줄어들 수 있어서 번호 비교는 신뢰할 수 없다).
-4. 새 게시판을 처음 추가한 시점에는, 그 게시판에 이미 있던 글들을 한꺼번에
+   seen_ids)에 있는지로 신규 여부를 판단한다. 번호(no) 크기나 목록에 실린
+   글 개수를 기준으로 판단하지 않는다 - 자동삭제로 번호가 줄어들 수 있어서
+   번호/개수 비교는 신뢰할 수 없다. 아래 로그에 찍히는 숫자는 어디까지나
+   "지금까지 누적 관리 중인 글 개수" 참고용 정보일 뿐, 그 숫자로 신규 여부를
+   판단하는 게 아니다.
+4. ID는 이미 본 적이 있지만 등록일자(posted_at)가 이전에 기록해둔 값과
+   달라진 경우는 "재등록(끌올)"로 보고, 신규 글과 동일하게 다시 알림 +
+   지원메일 처리를 한다 (seen_post_dates에 글별 마지막 등록일자를 저장해서
+   비교한다).
+5. 새 게시판을 처음 추가한 시점에는, 그 게시판에 이미 있던 글들을 한꺼번에
    "신규"로 오인해서 스팸 알림을 보내지 않도록, 게시판별로 "첫 실행 1회"는
-   조용히 seen_ids만 채우고 알림은 생략한다 (bootstrapped_boards로 추적).
-5. 신규 글이 있으면 상세페이지에서 이메일/마감일 등을 찾아 텔레그램 알림 +
-   (TEST_MODE 아니면 실제) 지원메일을 보낸다.
-6. 처리 결과를 state.json에 저장하고, GitHub Actions가 이 파일을 커밋해서
+   조용히 seen_ids/seen_post_dates만 채우고 알림은 생략한다
+   (bootstrapped_boards로 추적).
+6. 신규/재등록 글이 있으면 상세페이지에서 이메일/마감일 등을 찾아 텔레그램
+   알림 + (TEST_MODE 아니면 실제) 지원메일을 보낸다.
+7. 처리 결과를 state.json에 저장하고, GitHub Actions가 이 파일을 커밋해서
    다음 실행 때 이어서 비교한다.
 
 주의
@@ -32,6 +40,10 @@ KICPA(한국공인회계사회) 구인게시판 신규 공고 감시 → 텔레�
 - 목록 페이지의 "상세보기" 링크는 자바스크립트로 동작하는 것으로 보여서,
   정규식으로 ijIdNum 숫자를 최대한 추측해서 찾는다. 실패하면 상세 정보 없이
   목록 링크로 대체한다.
+- 이 파일을 처음 배포한 시점 기준으로, 그 이전부터 state.json에 있던 글들은
+  seen_post_dates에 기준 등록일자가 없다. 그런 글들은 배포 후 첫 실행에서
+  현재 등록일자를 조용히 기준값으로 채워 넣기만 하고, 재등록 알림은 그 다음
+  변화가 감지될 때부터 정상 동작한다.
 """
 
 import imaplib
@@ -132,7 +144,10 @@ def position_word(title: str) -> str:
 
 def fingerprint(board: dict, row: dict) -> str:
     """행의 고유 식별자. ijIdNum이 잡히면 그걸 쓰고, 못 잡았으면 제목+회사+
-    등록일 조합으로 대체 식별한다."""
+    등록일 조합으로 대체 식별한다. (등록일이 fp에 포함되므로, ID가 안 잡히는
+    글은 등록일이 바뀌는 순간 자동으로 "새 글"처럼 처리된다 - 재등록 감지가
+    이미 내장되어 있는 셈. ID가 잡히는 일반적인 경우의 재등록 감지는
+    seen_post_dates로 별도 처리한다.)"""
     prefix = board["id_prefix"]
     if row.get("id"):
         return f"{prefix}id:{row['id']}"
@@ -152,6 +167,12 @@ def load_state() -> dict:
             # 건너뛴다. general처럼 새로 추가되는 게시판만 부트스트랩 대상.
             data["bootstrapped_boards"] = ["intern"]
             migrated = True
+        if "seen_post_dates" not in data:
+            # 재등록(끌올) 감지를 위한 필드. 이 필드가 없던 예전 state.json에는
+            # 기준 등록일자가 없으므로, 이번 실행에서 지금 보이는 값들로
+            # 조용히 채워 넣고 다음 변화부터 재등록으로 인식한다.
+            data["seen_post_dates"] = {}
+            migrated = True
         data.setdefault("sent_applications", [])
         data.setdefault("notified_reply_ids", [])
         data["_migrated"] = migrated
@@ -159,6 +180,7 @@ def load_state() -> dict:
     return {
         "seen_ids": [],
         "bootstrapped_boards": [],
+        "seen_post_dates": {},
         "sent_applications": [],
         "notified_reply_ids": [],
     }
@@ -293,12 +315,15 @@ def fetch_detail(detail_url_tmpl: str, row_id: str) -> dict:
         return {}
 
 
-def format_message(board: dict, row: dict, detail: dict) -> str:
+def format_message(board: dict, row: dict, detail: dict, is_bump: bool = False) -> str:
+    tag = "♻️ 재등록(끌올)" if is_bump else "🚨"
     lines = [
-        f"🚨 {board['label']}",
+        f"{tag} {board['label']}",
         "",
         f"[{row['company']}] {row['title']}",
     ]
+    if is_bump:
+        lines.append("(이전에 이미 지원 처리했던 글이 등록일자를 바꿔 다시 올라왔습니다)")
     extra = []
     if row.get("region"):
         extra.append(f"지역: {row['region']}")
@@ -411,6 +436,7 @@ def send_application_email(row: dict, detail: dict) -> dict | None:
 
 def process_board(board: dict, state: dict) -> None:
     seen_ids = set(state["seen_ids"])
+    seen_post_dates = state.setdefault("seen_post_dates", {})
     is_bootstrap = board["key"] not in state["bootstrapped_boards"]
 
     html = fetch_list_html(board["list_url"])
@@ -428,31 +454,59 @@ def process_board(board: dict, state: dict) -> None:
         row["_fp"] = fingerprint(board, row)
 
     if is_bootstrap:
-        seen_ids.update(row["_fp"] for row in rows)
+        for row in rows:
+            seen_ids.add(row["_fp"])
+            seen_post_dates[row["_fp"]] = row.get("posted_at", "")
         state["seen_ids"] = sorted(seen_ids)[-1000:]
         state["bootstrapped_boards"].append(board["key"])
         print(f"[INFO] [{board['key']}] 최초 감시 시작 - 현재 글 {len(rows)}건을 조용히 등록만 했습니다 (알림 생략).")
         return
 
-    new_rows = [r for r in rows if r["_fp"] not in seen_ids]
-    new_rows.sort(key=lambda r: r["no"])
+    # 판단 기준: (1) fp가 seen_ids에 아예 없으면 신규, (2) fp는 이미 있지만
+    # 저장해둔 등록일자와 지금 등록일자가 다르면 재등록(끌올). 목록에 실린
+    # 글 개수나 번호(no) 크기는 이 판단에 전혀 쓰지 않는다.
+    new_rows = []
+    bumped_rows = []
+    for row in rows:
+        fp = row["_fp"]
+        cur_date = row.get("posted_at", "")
+        if fp not in seen_ids:
+            new_rows.append(row)
+            continue
+        prev_date = seen_post_dates.get(fp)
+        if prev_date and cur_date and cur_date != prev_date:
+            bumped_rows.append(row)
 
-    if not new_rows:
-        print(f"[INFO] [{board['key']}] 신규 공고 없음. (확인된 글 수: {len(seen_ids)})")
-        return
+    to_process = new_rows + bumped_rows
+    to_process.sort(key=lambda r: r["no"])
 
-    for row in new_rows:
-        detail = fetch_detail(board["detail_url"], row["id"]) if row.get("id") else {}
-        message = format_message(board, row, detail)
-        send_telegram(message)
-        print(f"[INFO] [{board['key']}] 알림 전송: #{row['no']} {row['title']}")
-        if detail.get("attachments"):
-            print(f"[INFO] [{board['key']}] #{row['no']} {row['title']} - 첨부파일(자체 양식) 감지, 자동 지원메일 건너뜀.")
-        else:
-            record = send_application_email(row, detail)
-            if record:
-                state.setdefault("sent_applications", []).append(record)
+    if not to_process:
+        print(
+            f"[INFO] [{board['key']}] 신규/재등록 공고 없음 "
+            f"(판단 기준: 글 ID + 등록일자 변경 / 참고: 누적 관리 중인 글 {len(seen_ids)}건)"
+        )
+    else:
+        bumped_fps = {r["_fp"] for r in bumped_rows}
+        for row in to_process:
+            is_bump = row["_fp"] in bumped_fps
+            detail = fetch_detail(board["detail_url"], row["id"]) if row.get("id") else {}
+            message = format_message(board, row, detail, is_bump=is_bump)
+            send_telegram(message)
+            tag = "재등록" if is_bump else "신규"
+            print(f"[INFO] [{board['key']}] {tag} 알림 전송: #{row['no']} {row['title']}")
+            if detail.get("attachments"):
+                print(f"[INFO] [{board['key']}] #{row['no']} {row['title']} - 첨부파일(자체 양식) 감지, 자동 지원메일 건너뜀.")
+            else:
+                record = send_application_email(row, detail)
+                if record:
+                    state.setdefault("sent_applications", []).append(record)
+
+    # 이번 크롤링에서 보인 모든 글에 대해 seen_ids/등록일자 기준값을 최신화한다.
+    # (신규/재등록 여부와 무관하게 항상 최신화해서, 다음 실행에서 정확히
+    # 비교할 수 있게 한다. 이 부분도 개수가 아니라 fp 단위로 개별 갱신한다.)
+    for row in rows:
         seen_ids.add(row["_fp"])
+        seen_post_dates[row["_fp"]] = row.get("posted_at", "")
 
     state["seen_ids"] = sorted(seen_ids)[-1000:]
 
