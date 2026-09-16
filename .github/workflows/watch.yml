@@ -44,6 +44,10 @@ jobs:
           GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           APPLICANT_NAME: ${{ secrets.APPLICANT_NAME }}
+          APPLICANT_BIRTH_DATE: ${{ secrets.APPLICANT_BIRTH_DATE }}
+          APPLICANT_BIRTH_YEAR: ${{ secrets.APPLICANT_BIRTH_YEAR }}
+          APPLICANT_PASS_YEAR: ${{ secrets.APPLICANT_PASS_YEAR }}
+          APPLICANT_PASS_ROUND: ${{ secrets.APPLICANT_PASS_ROUND }}
           TEST_MODE: ${{ secrets.TEST_MODE }}
         run: python kicpa_watcher.py
 
