@@ -93,9 +93,19 @@ ATTACHMENT_EXT_PATTERN = re.compile(r"\.(docx?|hwpx?)$", re.IGNORECASE)
 #  그 주소로 SMTP 발송 시 UnicodeEncodeError가 나서 실행 전체가 죽었다.)
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-# 회사가 메일제목/파일명 형식을 지정할 때 흔히 쓰는 문구들. 이 중 하나라도
-# 포함된 줄을 "형식 지정 줄"로 본다.
-NAMING_KEYWORDS = ("메일제목", "메일 제목", "이메일제목", "이메일 제목", "파일제목", "파일 제목", "파일명")
+# 회사가 메일제목/파일명 형식을 지정할 때 흔히 쓰는 문구들.
+# 메일제목용과 파일명용을 따로 둔다. (예전에는 줄에 "메일"이라는 글자만
+# 있어도 메일제목 지정으로 봤는데, "이메일로 제출하고, 파일명에 [...]"
+# 같은 문장에서 문장 전체가 메일 제목으로 들어가는 오작동이 있었다.)
+SUBJECT_KEYWORDS = ("메일제목", "메일 제목", "이메일제목", "이메일 제목")
+FILE_KEYWORDS = ("파일제목", "파일 제목", "파일명")
+
+# 형식 문자열로 인정할 최대 길이. 이보다 길면 형식이 아니라 일반 안내
+# 문장을 잘못 잡은 것으로 보고 버린다.
+MAX_NAMING_PATTERN_LEN = 50
+
+# "파일명에 [이름_수습_출생연도]를 기재" 처럼 괄호로 감싼 형식을 찾는 패턴
+BRACKET_PATTERN = re.compile(r"[\[【〔<〈]([^\]】〕>〉\n]{2,50})[\]】〕>〉]")
 
 # "다른 서류와 병합해서 1개 파일로 제출"류의 요구를 감지하기 위한 키워드.
 # 두 종류(병합 동작 + 병합 대상 서류)가 같이 있어야 병합 요구로 판단한다.
@@ -234,31 +244,52 @@ def sanitize_filename(name: str) -> str:
     return name
 
 
+def _find_pattern_after_keyword(line: str, keywords: tuple) -> str:
+    """line에서 keywords 중 하나가 나온 위치 뒤쪽에서 형식 문자열을 뽑는다.
+    1) 키워드 바로 뒤에 콜론이 있고 그 뒤 내용이 짧으면 그 내용 전체를 쓴다.
+       예) "메일제목 : [해림] 파트타임 CPA 지원 - 지원자명"
+    2) 아니면 키워드 뒤쪽에서 괄호로 감싼 부분을 찾는다.
+       예) "파일명에 [이름_수습_출생연도]를 기재하여 ..."
+    3) 둘 다 없거나 너무 길면 빈 문자열(= 형식 지정 없음으로 간주).
+    키워드보다 앞에 있는 콜론("5. 지원방법: ...")은 쓰지 않는다."""
+    positions = [line.find(kw) for kw in keywords if kw in line]
+    if not positions:
+        return ""
+    rest = line[min(positions):]
+
+    for colon in (":", "："):
+        if colon in rest:
+            after = rest.split(colon, 1)[1].strip()
+            if after and len(after) <= MAX_NAMING_PATTERN_LEN:
+                return after
+            break
+
+    m = BRACKET_PATTERN.search(rest)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def extract_naming_requirements(text: str) -> dict:
     """상세페이지 본문 텍스트에서 회사가 지정한 메일제목/파일명 형식을 찾는다.
-    한 줄에 "메일제목"과 "파일제목"이 같이 언급되면(예: "메일제목 및 파일제목 :
-    [...]") 같은 값을 양쪽에 다 적용한다. 반환값의 키는 subject_pattern /
-    file_pattern이며, 못 찾으면 해당 키가 아예 없다."""
+    메일제목은 "메일제목"류 키워드가, 파일명은 "파일명"류 키워드가 있어야만
+    인식한다. 한 줄에 둘 다 있으면(예: "메일제목 및 파일제목 : [...]") 같은
+    값을 양쪽에 적용한다. 반환값의 키는 subject_pattern / file_pattern이며,
+    못 찾으면 해당 키가 아예 없다."""
     result: dict = {}
     for line in text.split("\n"):
-        if not any(kw in line for kw in NAMING_KEYWORDS):
+        has_subject = any(kw in line for kw in SUBJECT_KEYWORDS)
+        has_file = any(kw in line for kw in FILE_KEYWORDS)
+        if not (has_subject or has_file):
             continue
-        if ":" in line:
-            raw = line.split(":", 1)[1]
-        elif "：" in line:
-            raw = line.split("：", 1)[1]
-        else:
-            idx = min(line.find(kw) for kw in NAMING_KEYWORDS if kw in line)
-            raw = line[idx:]
-        raw = raw.strip()
-        if not raw:
-            continue
-        applies_subject = ("메일" in line) or ("이메일" in line)
-        applies_file = "파일" in line
-        if applies_subject:
-            result["subject_pattern"] = raw
-        if applies_file:
-            result["file_pattern"] = raw
+        if has_subject and "subject_pattern" not in result:
+            raw = _find_pattern_after_keyword(line, SUBJECT_KEYWORDS)
+            if raw:
+                result["subject_pattern"] = raw
+        if has_file and "file_pattern" not in result:
+            raw = _find_pattern_after_keyword(line, FILE_KEYWORDS)
+            if raw:
+                result["file_pattern"] = raw
     return result
 
 
