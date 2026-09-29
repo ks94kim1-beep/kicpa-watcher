@@ -87,6 +87,12 @@ from bs4 import BeautifulSoup
 # 경우가 많아서 여기 포함하면 오탐(정상 발송 건너뜀)이 너무 잦아진다.
 ATTACHMENT_EXT_PATTERN = re.compile(r"\.(docx?|hwpx?)$", re.IGNORECASE)
 
+# 이메일 주소 추출 패턴. 영문/숫자/일부 기호만 허용한다.
+# (예전에는 \w를 썼는데, 파이썬의 \w는 한글까지 포함해서
+#  "hsshim@akcpa.co.kr접수" 처럼 주소 뒤에 붙은 한글까지 주소로 잡혔고,
+#  그 주소로 SMTP 발송 시 UnicodeEncodeError가 나서 실행 전체가 죽었다.)
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 # 회사가 메일제목/파일명 형식을 지정할 때 흔히 쓰는 문구들. 이 중 하나라도
 # 포함된 줄을 "형식 지정 줄"로 본다.
 NAMING_KEYWORDS = ("메일제목", "메일 제목", "이메일제목", "이메일 제목", "파일제목", "파일 제목", "파일명")
@@ -399,7 +405,7 @@ def fetch_detail(detail_url_tmpl: str, row_id: str, company: str, position: str)
         text = soup.get_text("\n", strip=True)
 
         detail = {}
-        email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
+        email_match = EMAIL_PATTERN.search(text)
         if email_match:
             detail["email"] = email_match.group(0)
         deadline_match = re.search(r"마감일[^\d]*(\d{4}\.\d{2}\.\d{2})", text)
@@ -607,11 +613,16 @@ def send_application_email(row: dict, detail: dict) -> dict:
                 "title": row["title"],
                 "sent_at": datetime.now(timezone.utc).isoformat(),
             }
-    except (smtplib.SMTPException, OSError) as e:
-        # OSError(네트워크 타임아웃 등)도 잡는다. 예전에는 SMTPException만 잡아서
-        # 타임아웃이 나면 실행 전체가 죽고 state.json이 저장되지 않았고, 그 결과
-        # 다음 실행에서 이미 보낸 회사에 중복 발송될 위험이 있었다.
+    except (smtplib.SMTPException, OSError, UnicodeError) as e:
+        # OSError(네트워크 타임아웃 등)와 UnicodeError(주소에 한글 등 비ASCII
+        # 문자가 섞인 경우)도 잡는다. 여기서 못 잡은 에러가 나면 실행 전체가
+        # 죽고 state.json이 저장되지 않아서, 같은 공고 알림이 매 실행마다
+        # 반복되고 뒤에 있는 공고들은 아예 처리되지 않는다.
         print(f"[ERROR] 지원메일 발송 실패: {e}", file=sys.stderr)
+        send_telegram(
+            f"❌ 지원메일 발송 실패\n\n[{row['company']}] {row['title']}\n"
+            f"수신 주소: {recipient}\n에러: {e}\n\n직접 확인 후 지원해주세요."
+        )
         result["status"] = "send_failed"
     return result
 
