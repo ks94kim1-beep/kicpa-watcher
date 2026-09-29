@@ -202,7 +202,10 @@ def build_custom_name(raw_pattern: str, company: str, position: str) -> tuple[st
         ("합격회차", APPLICANT_PASS_ROUND),
         ("회사명", company),
         ("지원분야", position),
+        ("지원자명", APPLICANT_NAME),
+        ("지원자", APPLICANT_NAME),
         ("성명", APPLICANT_NAME),
+        ("성함", APPLICANT_NAME),
         ("이름", APPLICANT_NAME),
         ("직무", position),
     ]
